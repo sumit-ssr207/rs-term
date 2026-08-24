@@ -1,0 +1,440 @@
+//! tmux-backed terminal: each node attaches a persistent tmux session inside a
+//! PTY. Sessions live on a private tmux server (`-L rs-term`) so they survive
+//! app restarts. A background poller asks tmux what the pane is currently doing
+//! and exposes a short summary used as the node's title.
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
+
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+
+/// Location of a usable tmux binary + our dedicated config/socket.
+struct TmuxEnv {
+    bin: String,
+    conf: PathBuf,
+    socket: String,
+}
+
+const TMUX_CONF: &str = "\
+set -g status off
+set -g history-limit 20000
+set -g escape-time 10
+set -g focus-events on
+set -g default-terminal \"xterm-256color\"
+setw -g aggressive-resize on
+";
+
+fn config_dir() -> PathBuf {
+    let base = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    Path::new(&base).join(".rs-term")
+}
+
+/// Detect tmux once. Returns None if no tmux is available (callers fall back
+/// to a plain shell).
+fn tmux_env() -> Option<&'static TmuxEnv> {
+    static TMUX: OnceLock<Option<TmuxEnv>> = OnceLock::new();
+    TMUX.get_or_init(|| {
+        let candidates = [
+            "/opt/homebrew/bin/tmux",
+            "/usr/local/bin/tmux",
+            "/usr/bin/tmux",
+            "/opt/local/bin/tmux",
+        ];
+        let bin = candidates
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                // Fall back to PATH lookup.
+                Command::new("tmux")
+                    .arg("-V")
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|_| "tmux".to_string())
+            })?;
+        let dir = config_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let conf = dir.join("tmux.conf");
+        let _ = std::fs::write(&conf, TMUX_CONF);
+        Some(TmuxEnv {
+            bin,
+            conf,
+            socket: "rs-term".to_string(),
+        })
+    })
+    .as_ref()
+}
+
+/// Stable tmux session name for a node id.
+pub fn session_name(id: u64) -> String {
+    format!("rsterm_{id}")
+}
+
+pub struct PtyTerminal {
+    pub parser: Arc<Mutex<vt100::Parser>>,
+    /// Short "what is this doing" summary, updated by the poller thread.
+    pub summary: Arc<Mutex<String>>,
+    writer: Box<dyn Write + Send>,
+    master: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+    rows: u16,
+    cols: u16,
+    session: String,
+    running: Arc<AtomicBool>,
+    /// Whether this terminal is backed by a tmux session.
+    tmux_backed: bool,
+    /// Whether the tmux pane is currently in copy-mode (scrolled back).
+    /// Kept accurate by the poller thread reading `pane_in_mode`.
+    in_copy: Arc<AtomicBool>,
+}
+
+impl PtyTerminal {
+    /// Attach (or create) the tmux session for `id`, sized `rows` x `cols`.
+    ///
+    /// `startup`, if set, is a command run in a login shell when the session is
+    /// first created (e.g. "claude"); after it exits the shell stays open.
+    pub fn spawn(
+        rows: u16,
+        cols: u16,
+        cwd: Option<&Path>,
+        ctx: egui::Context,
+        id: u64,
+        startup: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        let session = session_name(id);
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        // A login shell that runs the startup command then drops to an interactive
+        // shell, so the node stays usable after the agent exits.
+        let startup_args = startup.map(|cmd| {
+            vec![
+                "-l".to_string(),
+                "-c".to_string(),
+                format!("{cmd}; exec ${{SHELL:-/bin/zsh}}"),
+            ]
+        });
+
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+
+        let env = tmux_env();
+        let mut cmd = match env {
+            Some(t) => {
+                // tmux -L rs-term -f conf new-session -A -s <name> -x C -y R [-c dir] [cmd...]
+                let mut c = CommandBuilder::new(&t.bin);
+                c.arg("-L");
+                c.arg(&t.socket);
+                c.arg("-f");
+                c.arg(&t.conf);
+                c.arg("new-session");
+                c.arg("-A");
+                c.arg("-s");
+                c.arg(&session);
+                c.arg("-x");
+                c.arg(cols.to_string());
+                c.arg("-y");
+                c.arg(rows.to_string());
+                if let Some(dir) = cwd {
+                    c.arg("-c");
+                    c.arg(dir);
+                }
+                // Trailing command that tmux runs on session creation.
+                if let Some(args) = &startup_args {
+                    c.arg(&shell);
+                    for a in args {
+                        c.arg(a);
+                    }
+                }
+                c
+            }
+            None => {
+                // No tmux: plain shell (optionally running the startup command).
+                let mut c = CommandBuilder::new(&shell);
+                if let Some(args) = &startup_args {
+                    for a in args {
+                        c.arg(a);
+                    }
+                }
+                match cwd {
+                    Some(dir) => c.cwd(dir),
+                    None => {
+                        if let Ok(home) = std::env::var("HOME") {
+                            c.cwd(home);
+                        }
+                    }
+                }
+                c
+            }
+        };
+        cmd.env("TERM", "xterm-256color");
+
+        let child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader()?;
+        let writer = pair.master.take_writer()?;
+
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 20_000)));
+        let summary = Arc::new(Mutex::new(String::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        let in_copy = Arc::new(AtomicBool::new(false));
+        let tmux_backed = env.is_some();
+
+        // Reader thread: shell output -> vt100 grid.
+        let parser_thread = parser.clone();
+        let ctx_reader = ctx.clone();
+        thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(mut p) = parser_thread.lock() {
+                            p.process(&buf[..n]);
+                        }
+                        ctx_reader.request_repaint();
+                    }
+                    Err(_) => break,
+                }
+            }
+            ctx_reader.request_repaint();
+        });
+
+        // Poller thread: ask tmux what the pane is doing -> title summary.
+        if let Some(t) = env {
+            let bin = t.bin.clone();
+            let sock = t.socket.clone();
+            let sname = session.clone();
+            let sum = summary.clone();
+            let run = running.clone();
+            let in_copy_poll = in_copy.clone();
+            let ctx_poll = ctx.clone();
+            thread::spawn(move || {
+                // Belt-and-suspenders: make sure the status bar is off.
+                for _ in 0..20 {
+                    if !run.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let up = Command::new(&bin)
+                        .args(["-L", &sock, "has-session", "-t", &sname])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+                    if up {
+                        let _ = Command::new(&bin)
+                            .args(["-L", &sock, "set-option", "-t", &sname, "status", "off"])
+                            .output();
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(150));
+                }
+
+                while run.load(Ordering::Relaxed) {
+                    if let Ok(o) = Command::new(&bin)
+                        .args([
+                            "-L",
+                            &sock,
+                            "display-message",
+                            "-p",
+                            "-t",
+                            &sname,
+                            "#{pane_current_command}\t#{pane_current_path}\t#{pane_in_mode}",
+                        ])
+                        .output()
+                    {
+                        if o.status.success() {
+                            let raw = String::from_utf8_lossy(&o.stdout);
+                            let line = raw.trim_end_matches('\n');
+                            let mut it = line.split('\t');
+                            let cmd = it.next().unwrap_or("");
+                            let path = it.next().unwrap_or("");
+                            let mode = it.next().unwrap_or("0").trim();
+
+                            in_copy_poll.store(mode == "1", Ordering::Relaxed);
+
+                            let title = summarize(cmd, path);
+                            if let Ok(mut g) = sum.lock() {
+                                if *g != title {
+                                    *g = title;
+                                    ctx_poll.request_repaint();
+                                }
+                            }
+                        }
+                    }
+                    // Sleep ~1.5s, but wake promptly if we're shutting down.
+                    for _ in 0..10 {
+                        if !run.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(150));
+                    }
+                }
+            });
+        }
+
+        Ok(Self {
+            parser,
+            summary,
+            writer,
+            master: pair.master,
+            child,
+            rows,
+            cols,
+            session,
+            running,
+            tmux_backed,
+            in_copy,
+        })
+    }
+
+    pub fn send(&mut self, bytes: &[u8]) {
+        // Typing returns to the live bottom of the buffer.
+        if self.tmux_backed {
+            // If we're scrolled back (copy-mode), cancel it so keystrokes reach
+            // the shell rather than the copy-mode command table.
+            if self.in_copy.load(Ordering::Relaxed) {
+                if let Some(t) = tmux_env() {
+                    let _ = Command::new(&t.bin)
+                        .args(["-L", &t.socket, "send-keys", "-t", &self.session, "-X", "cancel"])
+                        .output();
+                }
+                self.in_copy.store(false, Ordering::Relaxed);
+            }
+        } else if let Ok(mut p) = self.parser.lock() {
+            p.set_scrollback(0);
+        }
+        let _ = self.writer.write_all(bytes);
+        let _ = self.writer.flush();
+    }
+
+    /// Scroll the view. Positive `delta` moves toward older output; negative
+    /// moves back toward the live bottom.
+    ///
+    /// For tmux terminals this drives tmux copy-mode (tmux keeps the history,
+    /// not our vt100 parser). For plain shells it uses the vt100 scrollback.
+    pub fn scroll_lines(&mut self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        if self.tmux_backed {
+            let Some(t) = tmux_env() else { return };
+            let count = delta.unsigned_abs().to_string();
+            if delta > 0 {
+                // Enter copy-mode (no-op preserving position if already in it),
+                // then scroll up. `-e` auto-exits when scrolled back to bottom.
+                let _ = Command::new(&t.bin)
+                    .args(["-L", &t.socket, "copy-mode", "-e", "-t", &self.session])
+                    .output();
+                let _ = Command::new(&t.bin)
+                    .args([
+                        "-L", &t.socket, "send-keys", "-t", &self.session, "-X", "-N", &count,
+                        "scroll-up",
+                    ])
+                    .output();
+                self.in_copy.store(true, Ordering::Relaxed);
+            } else if self.in_copy.load(Ordering::Relaxed) {
+                let _ = Command::new(&t.bin)
+                    .args([
+                        "-L", &t.socket, "send-keys", "-t", &self.session, "-X", "-N", &count,
+                        "scroll-down",
+                    ])
+                    .output();
+            }
+            return;
+        }
+        if let Ok(mut p) = self.parser.lock() {
+            let cur = p.screen().scrollback() as isize;
+            let target = (cur + delta).max(0) as usize;
+            p.set_scrollback(target);
+        }
+    }
+
+    /// Whether the view is currently scrolled back (viewing history).
+    pub fn is_scrolled(&self) -> bool {
+        if self.tmux_backed {
+            self.in_copy.load(Ordering::Relaxed)
+        } else {
+            self.parser
+                .lock()
+                .map(|p| p.screen().scrollback() > 0)
+                .unwrap_or(false)
+        }
+    }
+
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        if rows == self.rows && cols == self.cols {
+            return;
+        }
+        self.rows = rows;
+        self.cols = cols;
+        let _ = self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+        if let Ok(mut p) = self.parser.lock() {
+            p.set_size(rows, cols);
+        }
+    }
+
+    pub fn is_dead(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
+    /// Permanently destroy the underlying tmux session (used on explicit close).
+    pub fn kill_session(&self) {
+        if let Some(t) = tmux_env() {
+            let _ = Command::new(&t.bin)
+                .args(["-L", &t.socket, "kill-session", "-t", &self.session])
+                .output();
+        }
+    }
+}
+
+impl Drop for PtyTerminal {
+    fn drop(&mut self) {
+        // Stop the poller and detach the client, but leave the tmux session
+        // alive so it survives app restarts. Sessions are only destroyed via
+        // an explicit kill_session() on node/canvas close.
+        self.running.store(false, Ordering::Relaxed);
+        let _ = self.child.kill();
+    }
+}
+
+/// Turn a pane's current command + path into a short "what it's doing" title.
+fn summarize(cmd: &str, path: &str) -> String {
+    let cmd = cmd.trim();
+    let path = path.trim();
+
+    let base = path
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(path);
+    let base = if base.is_empty() { "~" } else { base };
+
+    let shells = [
+        "zsh", "bash", "sh", "fish", "-zsh", "-bash", "-fish", "login", "tmux",
+    ];
+    if cmd.is_empty() {
+        base.to_string()
+    } else if shells.contains(&cmd) {
+        base.to_string()
+    } else {
+        format!("{cmd} · {base}")
+    }
+}
