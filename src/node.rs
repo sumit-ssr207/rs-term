@@ -13,6 +13,14 @@ pub struct Node {
     /// Size in world units.
     pub size: egui::Vec2,
     pub kind: NodeKind,
+    /// Runtime-only: start time of the fading "attention" glow triggered by a
+    /// terminal bell (e.g. Claude finishing a turn). `None` when not glowing.
+    /// Not persisted.
+    pub glow_start: Option<std::time::Instant>,
+    /// Runtime-only: saved (pos, size) captured on a double-click "maximize" so
+    /// the next double-click can restore it. `Some` means currently maximized.
+    /// Not persisted.
+    pub restore: Option<(egui::Pos2, egui::Vec2)>,
 }
 
 pub enum NodeKind {
@@ -110,6 +118,8 @@ impl Node {
             pos: egui::pos2(s.pos[0], s.pos[1]),
             size: egui::vec2(s.size[0], s.size[1]),
             kind,
+            glow_start: None,
+            restore: None,
         }
     }
 }

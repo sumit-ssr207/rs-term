@@ -15,6 +15,8 @@ const MIN_H: f32 = 140.0;
 const GRID: f32 = 40.0;
 const ZOOM_MIN: f32 = 0.2;
 const ZOOM_MAX: f32 = 3.0;
+/// How long a terminal-bell "attention" glow pulses before fading out (seconds).
+const GLOW_DUR: f32 = 1.8;
 
 const CANVAS_BG: Color32 = Color32::from_rgb(0x14, 0x16, 0x1a);
 const NODE_BG: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x1e);
@@ -67,6 +69,8 @@ pub struct RsTermApp {
     dirty: bool,
     /// When the layout was last written to disk.
     last_save: std::time::Instant,
+    /// Throttle for the audible bell so a burst of bells can't spam the speaker.
+    last_bell_sound: std::time::Instant,
 }
 
 impl RsTermApp {
@@ -82,6 +86,7 @@ impl RsTermApp {
             confirm_close: None,
             dirty: false,
             last_save: std::time::Instant::now(),
+            last_bell_sound: std::time::Instant::now(),
         };
         app.load_layout();
         if app.canvases.is_empty() {
@@ -130,6 +135,17 @@ impl RsTermApp {
     /// Mark the layout as needing a save; the actual write is throttled.
     fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    /// Play the attention bell sound, throttled so a rapid burst of bells
+    /// doesn't stack up into a wall of noise.
+    fn trigger_bell_sound(&mut self) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_bell_sound) < std::time::Duration::from_millis(250) {
+            return;
+        }
+        self.last_bell_sound = now;
+        play_bell();
     }
 
     /// Write the layout now and reset the autosave throttle.
@@ -257,6 +273,8 @@ impl RsTermApp {
                 agent: false,
                 term: None,
             }),
+            glow_start: None,
+            restore: None,
         });
         c.focused = Some(id);
         self.mark_dirty();
@@ -280,6 +298,8 @@ impl RsTermApp {
                 agent: true,
                 term: None,
             }),
+            glow_start: None,
+            restore: None,
         });
         c.focused = Some(id);
         self.mark_dirty();
@@ -297,6 +317,8 @@ impl RsTermApp {
             kind: NodeKind::Note(NoteNode {
                 text: String::new(),
             }),
+            glow_start: None,
+            restore: None,
         });
         c.focused = Some(id);
         self.mark_dirty();
@@ -654,10 +676,11 @@ impl RsTermApp {
         }
 
         // --- scroll behavior ---
-        //   plain scroll            -> pan the canvas
-        //   Option + scroll         -> zoom the canvas
-        //   Option + scroll, with a terminal selected -> scroll that terminal
-        //   trackpad pinch          -> always zoom
+        //   plain scroll                             -> pan the canvas
+        //   plain scroll over a maximized terminal   -> scroll that terminal
+        //   Option + scroll                          -> zoom the canvas
+        //   Option + scroll over a terminal          -> scroll that terminal
+        //   trackpad pinch                           -> always zoom
         if let Some(ptr) = pointer {
             if panel.contains(ptr) {
                 let (scroll, pinch, alt) =
@@ -670,23 +693,28 @@ impl RsTermApp {
                 }
 
                 if scroll != Vec2::ZERO {
-                    if alt {
-                        if let Some(ti) = self.terminal_index_at(ptr) {
-                            // Scroll the hovered terminal's history (no click
-                            // needed). Accumulate fractional lines so slow
-                            // trackpad scrolls still register.
-                            self.scroll_accum += scroll.y / 12.0;
-                            let lines = self.scroll_accum.trunc() as isize;
-                            self.scroll_accum -= lines as f32;
-                            if lines != 0 {
-                                self.scroll_terminal(ti, lines);
-                            }
-                        } else {
-                            // Option + scroll zooms the canvas.
-                            let factor = (scroll.y * 0.0015).exp();
-                            let z = self.canvases[a].zoom;
-                            self.zoom_around(ptr, z * factor);
+                    // A terminal captures the wheel for its own scrollback when
+                    // either Option is held over it, or it's maximized (double-
+                    // clicked to fill the viewport) — a maximized window scrolls
+                    // its content like any ordinary app window.
+                    let scroll_target = self.terminal_index_at(ptr).filter(|&ti| {
+                        alt || self.canvases[a].nodes[ti].restore.is_some()
+                    });
+
+                    if let Some(ti) = scroll_target {
+                        // Accumulate fractional lines so slow trackpad scrolls
+                        // still register.
+                        self.scroll_accum += scroll.y / 12.0;
+                        let lines = self.scroll_accum.trunc() as isize;
+                        self.scroll_accum -= lines as f32;
+                        if lines != 0 {
+                            self.scroll_terminal(ti, lines);
                         }
+                    } else if alt {
+                        // Option + scroll (not over a terminal) zooms the canvas.
+                        let factor = (scroll.y * 0.0015).exp();
+                        let z = self.canvases[a].zoom;
+                        self.zoom_around(ptr, z * factor);
                     } else {
                         // Plain scroll pans the canvas.
                         self.canvases[a].offset += scroll;
@@ -728,6 +756,8 @@ impl RsTermApp {
 
         let mut bring_to_front: Option<u64> = None;
         let mut to_close: Option<u64> = None;
+        // Set true while any node is mid-glow, so we can drive a smooth animation.
+        let mut any_glow = false;
 
         let count = self.canvases[a].nodes.len();
         for i in 0..count {
@@ -841,6 +871,30 @@ impl RsTermApp {
                     self.canvases[a].focused = Some(id);
                     bring_to_front = Some(id);
                 }
+                // Double-click the title bar: maximize to fill the viewport;
+                // double-click again to restore the previous position + size.
+                if td.double_clicked() {
+                    self.canvases[a].moving = None;
+                    let node = &mut self.canvases[a].nodes[i];
+                    if let Some((rp, rs)) = node.restore.take() {
+                        node.pos = rp;
+                        node.size = rs;
+                    } else {
+                        node.restore = Some((node.pos, node.size));
+                        // Screen rect of the viewport (minus a margin) back into
+                        // world units at the current zoom/offset.
+                        let m = 24.0_f32;
+                        let tl = (Pos2::new(panel.min.x + m, panel.min.y + m).to_vec2()
+                            - offset)
+                            / zoom;
+                        let sz = (panel.size() - Vec2::splat(m * 2.0)) / zoom;
+                        node.pos = tl.to_pos2();
+                        node.size = Vec2::new(sz.x.max(MIN_W), sz.y.max(MIN_H));
+                    }
+                    self.canvases[a].focused = Some(id);
+                    bring_to_front = Some(id);
+                    self.mark_dirty();
+                }
                 if td.hovered() {
                     ctx.set_cursor_icon(egui::CursorIcon::Grab);
                 }
@@ -887,6 +941,44 @@ impl RsTermApp {
                 NodeKind::Terminal(_) => self.render_terminal(i, ui, body_rect, cell, ctx, is_focused),
                 NodeKind::Note(_) => self.render_note(i, ui, body_rect, zoom),
             }
+
+            // Attention glow (from a terminal bell — e.g. Claude finished),
+            // drawn on top of the body as a soft pulsing halo that fades out.
+            if let Some(start) = self.canvases[a].nodes[i].glow_start {
+                let e = start.elapsed().as_secs_f32();
+                if e >= GLOW_DUR {
+                    self.canvases[a].nodes[i].glow_start = None;
+                } else {
+                    let env = 1.0 - e / GLOW_DUR;
+                    let env = env * env; // ease-out fade
+                    let pulse = 0.5 + 0.5 * (e * std::f32::consts::TAU * 1.6).sin();
+                    let intensity = (env * (0.4 + 0.6 * pulse)).clamp(0.0, 1.0);
+                    let base = if is_agent { ORANGE } else { ACCENT };
+                    let gp = ui.painter_at(panel);
+                    // Soft outer halo: several expanding strokes, fainter outward.
+                    for k in 0..5 {
+                        let grow = (2.0 + k as f32 * 3.5) * zoom;
+                        let alpha = (intensity * 150.0 * (1.0 - k as f32 / 5.0)) as u8;
+                        if alpha == 0 {
+                            continue;
+                        }
+                        let col =
+                            Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha);
+                        gp.rect_stroke(rect.expand(grow), 6.0, Stroke::new((2.0 * zoom).max(1.0), col));
+                    }
+                    // Bright pulsing edge on the node itself.
+                    let ea = (intensity * 235.0) as u8;
+                    gp.rect_stroke(
+                        rect,
+                        6.0,
+                        Stroke::new(
+                            (2.0 * zoom).max(1.2),
+                            Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), ea),
+                        ),
+                    );
+                    any_glow = true;
+                }
+            }
         }
 
         if let Some(id) = bring_to_front {
@@ -895,6 +987,10 @@ impl RsTermApp {
         if let Some(id) = to_close {
             self.close_node(id);
             self.mark_dirty();
+        }
+        // Keep animating smoothly while any node is glowing.
+        if any_glow {
+            ctx.request_repaint();
         }
 
         // Minimap (bottom-right). Panning is suppressed while over it.
@@ -1201,6 +1297,17 @@ impl RsTermApp {
             (term.parser.clone(), term.is_dead(), term.is_scrolled())
         };
 
+        // A pane bell (e.g. Claude finishing a turn) rings the node: start the
+        // fading attention glow and play a soft sound.
+        let rang = match &self.canvases[a].nodes[i].kind {
+            NodeKind::Terminal(t) => t.term.as_ref().map(|tm| tm.take_bell()).unwrap_or(false),
+            _ => false,
+        };
+        if rang {
+            self.canvases[a].nodes[i].glow_start = Some(std::time::Instant::now());
+            self.trigger_bell_sound();
+        }
+
         if is_focused && !ctx.wants_keyboard_input() {
             self.send_input(i, ui);
         }
@@ -1385,6 +1492,25 @@ fn install_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+/// Play a short attention sound (macOS). Non-blocking: runs on a detached
+/// thread that also reaps the child, so the UI never stalls and no zombie is
+/// left behind. Falls back to an AppleScript beep if the sound file is missing.
+fn play_bell() {
+    std::thread::spawn(|| {
+        const SOUND: &str = "/System/Library/Sounds/Glass.aiff";
+        let played = std::path::Path::new(SOUND).exists()
+            && std::process::Command::new("afplay")
+                .arg(SOUND)
+                .status()
+                .is_ok();
+        if !played {
+            let _ = std::process::Command::new("osascript")
+                .args(["-e", "beep"])
+                .status();
+        }
+    });
 }
 
 /// Show the native macOS folder chooser and return the selected path.

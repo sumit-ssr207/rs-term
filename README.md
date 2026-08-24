@@ -42,7 +42,13 @@ tabs — a native Rust reimagining of the core idea behind
   color + truecolor + inverse video. Resize the card and the PTY/tmux reflow.
 - **Sticky notes** — editable text cards.
 - **Direct manipulation** — drag the title bar to move, corner to resize, ✕ to
-  close; focused card highlighted, status dot per node type.
+  close; **double-click the title bar to maximize** the node to fill the
+  viewport, double-click again to restore; focused card highlighted, status dot
+  per node type.
+- **Attention bell** — when a terminal rings the bell (e.g. Claude Code finishes
+  a turn and is waiting on you), the node plays a soft sound and pulses a gentle
+  glow around its whole frame, so you can tell at a glance which node needs you.
+  Window-title updates (which technically end in a bell) don't trigger it.
 - **Persistence** — full layout (canvases, node positions/sizes, notes, pan/zoom)
   saved to `~/.rs-term/layout.json`.
 
@@ -56,6 +62,7 @@ tabs — a native Rust reimagining of the core idea behind
 | Scroll                    | Zoom to cursor                  |
 | **⌥ + two-finger scroll** | Pan the canvas                  |
 | Drag empty space          | Pan the canvas                  |
+| **Double-click title bar**| Maximize node / restore         |
 | Right-click empty space   | "New terminal / note here" menu |
 
 Inside a focused terminal, all normal keys — `Ctrl` combos, arrows, Enter, Tab,

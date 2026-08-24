@@ -28,6 +28,9 @@ set -g escape-time 10
 set -g focus-events on
 set -g default-terminal \"xterm-256color\"
 setw -g aggressive-resize on
+set -g bell-action any
+set -g visual-bell off
+setw -g monitor-bell on
 ";
 
 fn config_dir() -> PathBuf {
@@ -96,6 +99,10 @@ pub struct PtyTerminal {
     /// Whether the pane's app has mouse reporting on (a TUI like Claude Code).
     /// Kept accurate by the poller thread reading `mouse_any_flag`.
     mouse_on: Arc<AtomicBool>,
+    /// Set true by the reader thread when a genuine attention bell (BEL, 0x07)
+    /// arrives from the pane — e.g. Claude Code finishing a turn. Consumed
+    /// (swapped back to false) by the UI via `take_bell`.
+    bell: Arc<AtomicBool>,
 }
 
 impl PtyTerminal {
@@ -195,6 +202,7 @@ impl PtyTerminal {
         let running = Arc::new(AtomicBool::new(true));
         let in_copy = Arc::new(AtomicBool::new(false));
         let mouse_on = Arc::new(AtomicBool::new(false));
+        let bell = Arc::new(AtomicBool::new(false));
         let tmux_backed = env.is_some();
 
         // Reader thread: shell output -> vt100 grid.
@@ -205,6 +213,7 @@ impl PtyTerminal {
         // tmux's box-drawing output would land in the grid as literal `q x l k`…
         let parser_thread = parser.clone();
         let ctx_reader = ctx.clone();
+        let bell_reader = bell.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             let mut acs = AcsFilter::default();
@@ -215,6 +224,9 @@ impl PtyTerminal {
                     Ok(n) => {
                         out.clear();
                         acs.process(&buf[..n], &mut out);
+                        if acs.bell {
+                            bell_reader.store(true, Ordering::Relaxed);
+                        }
                         if let Ok(mut p) = parser_thread.lock() {
                             p.process(&out);
                         }
@@ -254,6 +266,15 @@ impl PtyTerminal {
                             .output();
                         let _ = Command::new(&bin)
                             .args(["-L", &sock, "set-option", "-g", "mouse", "on"])
+                            .output();
+                        // Forward pane bells to us as a literal BEL (rather than
+                        // tmux drawing its own visual bell), so the reader thread
+                        // can detect "Claude finished" and glow the node.
+                        let _ = Command::new(&bin)
+                            .args(["-L", &sock, "set-option", "-g", "bell-action", "any"])
+                            .output();
+                        let _ = Command::new(&bin)
+                            .args(["-L", &sock, "set-option", "-g", "visual-bell", "off"])
                             .output();
                         break;
                     }
@@ -318,7 +339,14 @@ impl PtyTerminal {
             tmux_backed,
             in_copy,
             mouse_on,
+            bell,
         })
+    }
+
+    /// Consume a pending attention bell, returning whether one had rung since
+    /// the last call. Used by the UI to start the node's glow + play a sound.
+    pub fn take_bell(&self) -> bool {
+        self.bell.swap(false, Ordering::Relaxed)
     }
 
     pub fn send(&mut self, bytes: &[u8]) {
@@ -501,6 +529,11 @@ struct AcsFilter {
     /// Bytes of an in-progress escape sequence, buffered until we know whether
     /// to forward them (ordinary escape) or drop them (charset designation).
     pending: Vec<u8>,
+    /// Set when a genuine attention bell (a ground-state BEL) was seen during
+    /// the current `process` call. Reset at the start of each call. BELs that
+    /// merely terminate an OSC string (window-title updates) are handled in the
+    /// `Osc` state and never set this.
+    bell: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -521,6 +554,7 @@ impl Default for AcsState {
 
 impl AcsFilter {
     fn process(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        self.bell = false;
         for &b in input {
             match self.state {
                 AcsState::Ground => self.ground(b, out),
@@ -543,6 +577,7 @@ impl AcsFilter {
             }
             0x0e => self.shift_out = true,  // SO -> G1
             0x0f => self.shift_out = false, // SI -> G0
+            0x07 => self.bell = true,       // BEL — attention bell, consumed here
             _ => {
                 let line = if self.shift_out { self.g1_line } else { self.g0_line };
                 if line && (0x5f..=0x7e).contains(&b) {
@@ -720,5 +755,41 @@ mod tests {
     fn restore_stops_translation() {
         // After ESC ( B, `q` is a literal `q` again.
         assert_eq!(run(&[b"\x1b(0q\x1b(Bq"]), "─q");
+    }
+
+    /// Return whether processing `chunks` reported an attention bell.
+    fn bell(chunks: &[&[u8]]) -> bool {
+        let mut f = AcsFilter::default();
+        let mut out = Vec::new();
+        let mut rang = false;
+        for c in chunks {
+            f.process(c, &mut out);
+            rang |= f.bell;
+        }
+        rang
+    }
+
+    #[test]
+    fn ground_bel_is_an_attention_bell() {
+        assert!(bell(&[b"done\x07"]));
+    }
+
+    #[test]
+    fn osc_title_terminator_is_not_a_bell() {
+        // Shells set the window title with `ESC ] 0 ; title BEL` on every prompt.
+        // That terminating BEL must NOT be treated as an attention bell.
+        assert!(!bell(&[b"\x1b]0;my title\x07"]));
+        // …and it still isn't when split across reads.
+        assert!(!bell(&[b"\x1b]2;dir", b" name\x07"]));
+    }
+
+    #[test]
+    fn bell_flag_resets_each_process_call() {
+        let mut f = AcsFilter::default();
+        let mut out = Vec::new();
+        f.process(b"\x07", &mut out);
+        assert!(f.bell);
+        f.process(b"plain", &mut out);
+        assert!(!f.bell);
     }
 }
