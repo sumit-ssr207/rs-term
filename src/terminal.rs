@@ -198,16 +198,25 @@ impl PtyTerminal {
         let tmux_backed = env.is_some();
 
         // Reader thread: shell output -> vt100 grid.
+        //
+        // The bytes pass through `AcsFilter` first, which translates DEC Special
+        // Graphics (line-drawing) runs into real Unicode. vt100 0.15.2 ignores
+        // the `ESC ( 0` / `ESC ( B` charset-designation escapes, so without this
+        // tmux's box-drawing output would land in the grid as literal `q x l k`…
         let parser_thread = parser.clone();
         let ctx_reader = ctx.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
+            let mut acs = AcsFilter::default();
+            let mut out = Vec::with_capacity(8192);
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        out.clear();
+                        acs.process(&buf[..n], &mut out);
                         if let Ok(mut p) = parser_thread.lock() {
-                            p.process(&buf[..n]);
+                            p.process(&out);
                         }
                         ctx_reader.request_repaint();
                     }
@@ -465,5 +474,251 @@ fn summarize(cmd: &str, path: &str) -> String {
         base.to_string()
     } else {
         format!("{cmd} · {base}")
+    }
+}
+
+/// A small VT-aware byte filter that translates DEC Special Graphics
+/// (line-drawing) runs into Unicode before they reach the vt100 parser.
+///
+/// vt100 0.15.2 does not implement the G0/G1 charset-designation escapes
+/// (`ESC ( 0` selects line-drawing, `ESC ( B` restores ASCII), so line bytes
+/// like `q` `x` `l` `k` would otherwise be stored verbatim and shown as literal
+/// letters. tmux emits exactly these ACS runs when it repaints box-drawing for
+/// a client whose terminfo advertises `smacs`/`rmacs` (xterm-256color does).
+///
+/// The filter is a minimal state machine so it can pass ordinary escape/CSI/OSC
+/// sequences through untouched, only rewriting printable bytes while a
+/// line-drawing charset is active. State is retained across reads, so sequences
+/// split over buffer boundaries are handled.
+#[derive(Default)]
+struct AcsFilter {
+    state: AcsState,
+    /// Whether G0 / G1 currently designate the line-drawing charset.
+    g0_line: bool,
+    g1_line: bool,
+    /// Active charset: false = G0 (SI / 0x0f), true = G1 (SO / 0x0e).
+    shift_out: bool,
+    /// Bytes of an in-progress escape sequence, buffered until we know whether
+    /// to forward them (ordinary escape) or drop them (charset designation).
+    pending: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum AcsState {
+    Ground,
+    Esc,     // saw ESC (0x1b)
+    Scs(u8), // saw ESC + one of ( ) * + ; the intermediate is stored
+    Csi,     // saw ESC [ … consuming until a final byte
+    Osc,     // saw ESC ] … consuming until BEL or ST
+    OscEsc,  // inside OSC, saw ESC (expecting the \ of ST)
+}
+
+impl Default for AcsState {
+    fn default() -> Self {
+        AcsState::Ground
+    }
+}
+
+impl AcsFilter {
+    fn process(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        for &b in input {
+            match self.state {
+                AcsState::Ground => self.ground(b, out),
+                AcsState::Esc => self.esc(b, out),
+                AcsState::Scs(which) => self.scs(which, b),
+                AcsState::Csi => self.csi(b, out),
+                AcsState::Osc => self.osc(b, out),
+                AcsState::OscEsc => self.osc_esc(b, out),
+            }
+        }
+    }
+
+    fn ground(&mut self, b: u8, out: &mut Vec<u8>) {
+        match b {
+            0x1b => {
+                // Start buffering a possible charset designation.
+                self.pending.clear();
+                self.pending.push(b);
+                self.state = AcsState::Esc;
+            }
+            0x0e => self.shift_out = true,  // SO -> G1
+            0x0f => self.shift_out = false, // SI -> G0
+            _ => {
+                let line = if self.shift_out { self.g1_line } else { self.g0_line };
+                if line && (0x5f..=0x7e).contains(&b) {
+                    push_acs(b, out);
+                } else {
+                    out.push(b);
+                }
+            }
+        }
+    }
+
+    fn esc(&mut self, b: u8, out: &mut Vec<u8>) {
+        match b {
+            b'(' | b')' | b'*' | b'+' => {
+                // Charset designation — keep buffering, we'll drop the whole run.
+                self.pending.push(b);
+                self.state = AcsState::Scs(b);
+            }
+            b'[' => {
+                self.flush_pending(out);
+                out.push(b);
+                self.state = AcsState::Csi;
+            }
+            b']' => {
+                self.flush_pending(out);
+                out.push(b);
+                self.state = AcsState::Osc;
+            }
+            _ => {
+                // Any other ESC x (ESC 7, ESC M, ESC =, …) — forward verbatim.
+                self.flush_pending(out);
+                out.push(b);
+                self.state = AcsState::Ground;
+            }
+        }
+    }
+
+    fn scs(&mut self, which: u8, b: u8) {
+        // Intermediate bytes (e.g. `%` in a multi-byte designator) — keep going.
+        if (0x20..=0x2f).contains(&b) {
+            return;
+        }
+        // `0` selects DEC Special Graphics (line-drawing); anything else (B, A, …)
+        // restores a text charset.
+        let line = b == b'0';
+        match which {
+            b'(' => self.g0_line = line,
+            b')' => self.g1_line = line,
+            _ => {} // G2/G3 (`*`/`+`) are only reachable via SS2/SS3; ignore.
+        }
+        // Drop the whole `ESC ( X` run — vt100 ignores it anyway.
+        self.pending.clear();
+        self.state = AcsState::Ground;
+    }
+
+    fn csi(&mut self, b: u8, out: &mut Vec<u8>) {
+        out.push(b);
+        if (0x40..=0x7e).contains(&b) {
+            self.state = AcsState::Ground;
+        }
+    }
+
+    fn osc(&mut self, b: u8, out: &mut Vec<u8>) {
+        out.push(b);
+        match b {
+            0x07 => self.state = AcsState::Ground, // BEL terminator
+            0x1b => self.state = AcsState::OscEsc, // maybe ST (ESC \)
+            _ => {}
+        }
+    }
+
+    fn osc_esc(&mut self, b: u8, out: &mut Vec<u8>) {
+        out.push(b);
+        self.state = if b == b'\\' {
+            AcsState::Ground
+        } else {
+            AcsState::Osc
+        };
+    }
+
+    fn flush_pending(&mut self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.pending);
+        self.pending.clear();
+    }
+}
+
+/// Map a DEC Special Graphics byte (0x5f..=0x7e) to its Unicode glyph and append
+/// the UTF-8 to `out`. Bytes outside the table are emitted unchanged.
+fn push_acs(b: u8, out: &mut Vec<u8>) {
+    let s: &str = match b {
+        0x5f => " ",
+        // 0x60..=0x7e below
+        0x60 => "◆",
+        0x61 => "▒",
+        0x62 => "␉",
+        0x63 => "␌",
+        0x64 => "␍",
+        0x65 => "␊",
+        0x66 => "°",
+        0x67 => "±",
+        0x68 => "␤",
+        0x69 => "␋",
+        0x6a => "┘",
+        0x6b => "┐",
+        0x6c => "┌",
+        0x6d => "└",
+        0x6e => "┼",
+        0x6f => "⎺",
+        0x70 => "⎻",
+        0x71 => "─",
+        0x72 => "⎼",
+        0x73 => "⎽",
+        0x74 => "├",
+        0x75 => "┤",
+        0x76 => "┴",
+        0x77 => "┬",
+        0x78 => "│",
+        0x79 => "≤",
+        0x7a => "≥",
+        0x7b => "π",
+        0x7c => "≠",
+        0x7d => "£",
+        0x7e => "·",
+        _ => {
+            out.push(b);
+            return;
+        }
+    };
+    out.extend_from_slice(s.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(chunks: &[&[u8]]) -> String {
+        let mut f = AcsFilter::default();
+        let mut out = Vec::new();
+        for c in chunks {
+            f.process(c, &mut out);
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn translates_line_drawing_run() {
+        // ESC ( 0  qqq  ESC ( B  -> three horizontal lines.
+        assert_eq!(run(&[b"\x1b(0qqq\x1b(B"]), "───");
+    }
+
+    #[test]
+    fn corners_and_verticals() {
+        // lqk / x x / mqj  -> a tiny box's characters.
+        assert_eq!(run(&[b"\x1b(0lqkxxmqj\x1b(B"]), "┌─┐││└─┘");
+    }
+
+    #[test]
+    fn plain_text_untouched() {
+        assert_eq!(run(&[b"hello qqq world"]), "hello qqq world");
+    }
+
+    #[test]
+    fn csi_passes_through() {
+        // A colour SGR must survive verbatim, and `q` outside a run stays `q`.
+        assert_eq!(run(&[b"\x1b[1;31mq\x1b[0m"]), "\x1b[1;31mq\x1b[0m");
+    }
+
+    #[test]
+    fn charset_switch_split_across_reads() {
+        // Sequence and run fragmented over several buffers.
+        assert_eq!(run(&[b"\x1b", b"(0q", b"q", b"q\x1b(", b"B"]), "───");
+    }
+
+    #[test]
+    fn restore_stops_translation() {
+        // After ESC ( B, `q` is a literal `q` again.
+        assert_eq!(run(&[b"\x1b(0q\x1b(Bq"]), "─q");
     }
 }

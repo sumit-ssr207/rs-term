@@ -1170,6 +1170,11 @@ impl RsTermApp {
         };
         let startup = if agent { Some("claude") } else { None };
 
+        // While the resize handle is being dragged the body_rect changes every
+        // frame; resizing the pty each time SIGWINCHes tmux and jumps the cursor.
+        // Hold the pty size steady during the drag and apply it once on release.
+        let live_resize = self.canvases[a].resizing == Some(id);
+
         let (parser, dead, scrolled) = {
             let NodeKind::Terminal(t) = &mut self.canvases[a].nodes[i].kind else {
                 return;
@@ -1190,7 +1195,9 @@ impl RsTermApp {
                 }
             }
             let term = t.term.as_mut().unwrap();
-            term.resize(rows, cols);
+            if !live_resize {
+                term.resize(rows, cols);
+            }
             (term.parser.clone(), term.is_dead(), term.is_scrolled())
         };
 
@@ -1361,14 +1368,19 @@ fn install_fonts(ctx: &egui::Context) {
             fonts
                 .font_data
                 .insert("symbols".to_owned(), egui::FontData::from_owned(bytes));
-            // Only add the symbol fallback to the proportional (UI) family. The
-            // monospace family must stay pure so terminal cell metrics (advance
-            // width and row height) match the glyphs exactly.
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .push("symbols".to_owned());
+            // Append the symbol font as a *fallback* on both families. Because it
+            // sits after the primary font, egui only reaches for it when the
+            // primary lacks a glyph — so base cell metrics are unchanged, but the
+            // terminal grid (which renders with the monospace family) no longer
+            // shows tofu boxes for glyphs the mono font is missing, e.g. the
+            // block/symbol glyphs in the Claude Code banner.
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .push("symbols".to_owned());
+            }
             break;
         }
     }
@@ -1466,6 +1478,10 @@ fn key_to_bytes(key: egui::Key, m: &egui::Modifiers) -> Option<Vec<u8>> {
     }
     let seq: &[u8] = match key {
         egui::Key::Enter => b"\r",
+        // Shift+Tab sends CBT (back-tab); plain Tab sends HT. Claude Code uses
+        // Shift+Tab to cycle modes (the "manual mode" toggle), so it must reach
+        // the pty rather than being flattened to a plain tab.
+        egui::Key::Tab if m.shift => b"\x1b[Z",
         egui::Key::Tab => b"\t",
         egui::Key::Backspace => b"\x7f",
         egui::Key::Escape => b"\x1b",
