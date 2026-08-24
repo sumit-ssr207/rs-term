@@ -71,6 +71,8 @@ pub struct RsTermApp {
     last_save: std::time::Instant,
     /// Throttle for the audible bell so a burst of bells can't spam the speaker.
     last_bell_sound: std::time::Instant,
+    /// Whether the bottom-right minimap is shown (toggled from the tab bar).
+    show_minimap: bool,
 }
 
 impl RsTermApp {
@@ -87,6 +89,7 @@ impl RsTermApp {
             dirty: false,
             last_save: std::time::Instant::now(),
             last_bell_sound: std::time::Instant::now(),
+            show_minimap: true,
         };
         app.load_layout();
         if app.canvases.is_empty() {
@@ -122,6 +125,7 @@ impl RsTermApp {
             active: self.active,
             next_id: self.next_id,
             canvases,
+            show_minimap: self.show_minimap,
         };
         if let Ok(json) = serde_json::to_string_pretty(&saved) {
             let path = Self::layout_path();
@@ -179,6 +183,7 @@ impl RsTermApp {
             })
             .collect();
         self.active = saved.active.min(self.canvases.len().saturating_sub(1));
+        self.show_minimap = saved.show_minimap;
     }
 
     // --- coordinate transforms (active canvas) ---
@@ -484,6 +489,7 @@ impl RsTermApp {
             let mut switch: Option<usize> = None;
             let mut close_idx: Option<usize> = None;
             let mut add = false;
+            let mut toggle_map = false;
             ui.horizontal(|ui| {
                 let n = self.canvases.len();
                 for idx in 0..n {
@@ -513,6 +519,21 @@ impl RsTermApp {
                 if ui.button("+").on_hover_text("New canvas").clicked() {
                     add = true;
                 }
+                // Minimap toggle, pinned to the right edge of the tab bar.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let hint = if self.show_minimap {
+                        "Hide minimap"
+                    } else {
+                        "Show minimap"
+                    };
+                    if ui
+                        .selectable_label(self.show_minimap, "▦")
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        toggle_map = true;
+                    }
+                });
             });
             if let Some(idx) = switch {
                 self.active = idx;
@@ -523,6 +544,10 @@ impl RsTermApp {
             }
             if add {
                 self.add_canvas();
+                self.mark_dirty();
+            }
+            if toggle_map {
+                self.show_minimap = !self.show_minimap;
                 self.mark_dirty();
             }
         });
@@ -1011,9 +1036,10 @@ impl RsTermApp {
             ctx.request_repaint();
         }
 
-        // Minimap (bottom-right). Panning is suppressed while over it.
+        // Minimap (bottom-right). Panning is suppressed while over it. When the
+        // minimap is hidden its rect is inert, so panning works over that area.
         let mm_rect = Self::minimap_rect(panel);
-        let over_mm = pointer.map_or(false, |p| mm_rect.contains(p));
+        let over_mm = self.show_minimap && pointer.map_or(false, |p| mm_rect.contains(p));
 
         // "Open Folder" prompt for a new, unbound canvas.
         let show_card =
@@ -1102,7 +1128,9 @@ impl RsTermApp {
             });
         }
 
-        self.draw_minimap(ui, panel, mm_rect);
+        if self.show_minimap {
+            self.draw_minimap(ui, panel, mm_rect);
+        }
 
         if open_ws {
             self.open_workspace();

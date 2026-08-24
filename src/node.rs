@@ -50,6 +50,14 @@ pub struct SavedApp {
     pub active: usize,
     pub next_id: u64,
     pub canvases: Vec<SavedCanvas>,
+    /// Whether the bottom-right minimap is shown. Defaults to true so layouts
+    /// saved before this option existed keep showing it.
+    #[serde(default = "default_true")]
+    pub show_minimap: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize)]
