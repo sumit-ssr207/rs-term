@@ -6,6 +6,21 @@ tabs — a native Rust reimagining of the core idea behind
 [nodeterm](https://github.com/eneskirca/nodeterm), built with
 [`egui`](https://github.com/emilk/egui). No Electron, single ~6 MB binary.
 
+## ⚠️ Installing the app (unsigned build — read this first)
+
+> [!IMPORTANT]
+> This build is **not signed with a paid Apple Developer ID and not notarized**,
+> so on first launch macOS Gatekeeper will block it with a message like
+> *"can't be opened / unidentified developer / is damaged."* **This is expected**
+> — the app is fine. After unzipping, do **one** of the following (only needed once):
+>
+> - **Right-click `rs-term.app` → Open**, then click **Open** in the dialog, **or**
+> - **Run in Terminal:**
+>   ```bash
+>   xattr -cr /Applications/rs-term.app
+>   ```
+>   (clears the quarantine flag macOS adds to downloaded apps)
+
 ## Features
 
 - **tmux-backed terminals** — every terminal node is a persistent tmux session

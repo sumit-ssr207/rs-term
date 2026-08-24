@@ -22,6 +22,7 @@ struct TmuxEnv {
 
 const TMUX_CONF: &str = "\
 set -g status off
+set -g mouse on
 set -g history-limit 20000
 set -g escape-time 10
 set -g focus-events on
@@ -92,6 +93,9 @@ pub struct PtyTerminal {
     /// Whether the tmux pane is currently in copy-mode (scrolled back).
     /// Kept accurate by the poller thread reading `pane_in_mode`.
     in_copy: Arc<AtomicBool>,
+    /// Whether the pane's app has mouse reporting on (a TUI like Claude Code).
+    /// Kept accurate by the poller thread reading `mouse_any_flag`.
+    mouse_on: Arc<AtomicBool>,
 }
 
 impl PtyTerminal {
@@ -190,6 +194,7 @@ impl PtyTerminal {
         let summary = Arc::new(Mutex::new(String::new()));
         let running = Arc::new(AtomicBool::new(true));
         let in_copy = Arc::new(AtomicBool::new(false));
+        let mouse_on = Arc::new(AtomicBool::new(false));
         let tmux_backed = env.is_some();
 
         // Reader thread: shell output -> vt100 grid.
@@ -220,9 +225,11 @@ impl PtyTerminal {
             let sum = summary.clone();
             let run = running.clone();
             let in_copy_poll = in_copy.clone();
+            let mouse_on_poll = mouse_on.clone();
             let ctx_poll = ctx.clone();
             thread::spawn(move || {
-                // Belt-and-suspenders: make sure the status bar is off.
+                // Belt-and-suspenders: status bar off and mouse routing on (the
+                // latter lets wheel events reach mouse-aware apps like Claude Code).
                 for _ in 0..20 {
                     if !run.load(Ordering::Relaxed) {
                         return;
@@ -235,6 +242,9 @@ impl PtyTerminal {
                     if up {
                         let _ = Command::new(&bin)
                             .args(["-L", &sock, "set-option", "-t", &sname, "status", "off"])
+                            .output();
+                        let _ = Command::new(&bin)
+                            .args(["-L", &sock, "set-option", "-g", "mouse", "on"])
                             .output();
                         break;
                     }
@@ -250,7 +260,7 @@ impl PtyTerminal {
                             "-p",
                             "-t",
                             &sname,
-                            "#{pane_current_command}\t#{pane_current_path}\t#{pane_in_mode}",
+                            "#{pane_current_command}\t#{pane_current_path}\t#{pane_in_mode}\t#{mouse_any_flag}",
                         ])
                         .output()
                     {
@@ -261,8 +271,10 @@ impl PtyTerminal {
                             let cmd = it.next().unwrap_or("");
                             let path = it.next().unwrap_or("");
                             let mode = it.next().unwrap_or("0").trim();
+                            let mouse = it.next().unwrap_or("0").trim();
 
                             in_copy_poll.store(mode == "1", Ordering::Relaxed);
+                            mouse_on_poll.store(mouse == "1", Ordering::Relaxed);
 
                             let title = summarize(cmd, path);
                             if let Ok(mut g) = sum.lock() {
@@ -296,6 +308,7 @@ impl PtyTerminal {
             running,
             tmux_backed,
             in_copy,
+            mouse_on,
         })
     }
 
@@ -326,6 +339,22 @@ impl PtyTerminal {
     /// not our vt100 parser). For plain shells it uses the vt100 scrollback.
     pub fn scroll_lines(&mut self, delta: isize) {
         if delta == 0 {
+            return;
+        }
+        // Full-screen apps that request mouse (e.g. Claude Code) manage their own
+        // scrolling; tmux copy-mode has no history for the alternate screen. Send
+        // wheel events straight to the app instead (tmux `mouse on` routes them).
+        if self.tmux_backed && self.mouse_on.load(Ordering::Relaxed) {
+            let cx = (self.cols / 2).max(1);
+            let cy = (self.rows / 2).max(1);
+            let btn = if delta > 0 { 64 } else { 65 }; // SGR wheel up / down
+            let one = format!("\x1b[<{btn};{cx};{cy}M");
+            let mut seq = String::new();
+            for _ in 0..delta.unsigned_abs().min(8) {
+                seq.push_str(&one);
+            }
+            let _ = self.writer.write_all(seq.as_bytes());
+            let _ = self.writer.flush();
             return;
         }
         if self.tmux_backed {

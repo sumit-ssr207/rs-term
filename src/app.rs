@@ -973,7 +973,7 @@ impl RsTermApp {
             }
             let menu_world = self.canvases[a].menu_world;
             bg.context_menu(|ui| {
-                if ui.button("New terminal here").clicked() {
+                if ui.button("New Terminal here").clicked() {
                     self.add_terminal(menu_world);
                     ui.close_menu();
                 }
@@ -981,7 +981,7 @@ impl RsTermApp {
                     self.add_claude(menu_world);
                     ui.close_menu();
                 }
-                if ui.button("New note here").clicked() {
+                if ui.button("New Note here").clicked() {
                     self.add_note(menu_world);
                     ui.close_menu();
                 }
