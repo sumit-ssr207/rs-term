@@ -644,6 +644,24 @@ impl RsTermApp {
         let cell = self.cell.unwrap_or(Vec2::new(8.0, 16.0));
         let a = self.active;
 
+        // The terminal grid is painted directly — it is not an egui widget, so
+        // egui must not hold keyboard focus while a terminal node is focused.
+        // Every node's click/drag/resize area senses clicks and is therefore
+        // keyboard-focusable, and egui-winit consumes Tab to move focus to the
+        // first such widget. Without this, pressing Tab (which Claude Code uses
+        // constantly — completions, Shift+Tab mode toggle) parks egui's focus on
+        // a hidden widget, flips `wants_keyboard_input()` true, and silently
+        // swallows every subsequent keystroke until the node is clicked again.
+        // Clearing egui focus each frame keeps keystrokes flowing to the pty.
+        let terminal_focused = self.canvases[a]
+            .focused
+            .and_then(|fid| self.canvases[a].nodes.iter().find(|n| n.id == fid))
+            .map(|n| matches!(n.kind, NodeKind::Terminal(_)))
+            .unwrap_or(false);
+        if terminal_focused {
+            ctx.memory_mut(|m| m.stop_text_input());
+        }
+
         let pointer = ui.input(|i| i.pointer.hover_pos());
 
         // --- app-level keyboard shortcuts ---
@@ -1308,7 +1326,14 @@ impl RsTermApp {
             self.trigger_bell_sound();
         }
 
-        if is_focused && !ctx.wants_keyboard_input() {
+        // Gate on the canvas's own focus, not egui's `wants_keyboard_input()`:
+        // egui may momentarily hold focus on a hidden widget (e.g. mid-Tab),
+        // and blocking on that would drop keystrokes — including the very Tab /
+        // Shift+Tab that triggered it. A Note being edited sets the canvas focus
+        // to the note, so `is_focused` already excludes that case. Suppress input
+        // while the close-canvas confirmation modal is up so Enter/Esc drive the
+        // dialog rather than leaking into the pty.
+        if is_focused && self.confirm_close.is_none() {
             self.send_input(i, ui);
         }
 
@@ -1319,43 +1344,57 @@ impl RsTermApp {
         let screen = guard.screen();
         let font = FontId::monospace(BASE_FONT * zoom);
 
+        // Paint the grid. Backgrounds are batched into runs of the same style,
+        // but each glyph is drawn snapped to its own cell (`col * cw`) rather
+        // than laying a whole run out as a single string. egui positions the
+        // glyphs of a multi-character string using the font's own advance
+        // widths, which line up with the grid pitch `cw` only at zoom == 1.0 and
+        // only for glyphs the monospace font itself provides. At any other zoom
+        // — or for any glyph served by the Unicode fallback font (box-drawing,
+        // symbols, wide characters) — the run drifts off the grid while the
+        // block cursor (drawn at `cc * cw`) stays put, which reads as a jumpy
+        // cursor and garbled lines. Per-cell placement keeps every glyph on the
+        // grid at every zoom level.
         for row in 0..rows {
             let y = inner.min.y + row as f32 * ch;
             let mut col = 0u16;
             while col < cols {
                 let (fg, bg, inv) = cell_style(screen, row, col);
                 let start = col;
-                let mut text = String::new();
-                loop {
+                while col < cols {
                     let (cfg, cbg, cinv) = cell_style(screen, row, col);
                     if cfg != fg || cbg != bg || cinv != inv {
                         break;
                     }
-                    match screen.cell(row, col) {
-                        Some(c) if !c.contents().is_empty() => text.push_str(&c.contents()),
-                        _ => text.push(' '),
-                    }
                     col += 1;
-                    if col >= cols {
-                        break;
-                    }
                 }
-                let x = inner.min.x + start as f32 * cw;
-                let run_w = (col - start) as f32 * cw;
 
                 let raw_fg = to_color(fg, TERM_FG);
                 let raw_bg = to_color(bg, TERM_BG);
                 let (eff_fg, eff_bg) = if inv { (raw_bg, raw_fg) } else { (raw_fg, raw_bg) };
 
+                // One background rect for the whole run.
                 if inv || bg != vt100::Color::Default {
+                    let x = inner.min.x + start as f32 * cw;
+                    let run_w = (col - start) as f32 * cw;
                     painter.rect_filled(
                         Rect::from_min_size(Pos2::new(x, y), Vec2::new(run_w, ch)),
                         0.0,
                         eff_bg,
                     );
                 }
-                if !text.trim().is_empty() {
-                    painter.text(Pos2::new(x, y), Align2::LEFT_TOP, text, font.clone(), eff_fg);
+
+                // One glyph per cell, each snapped to its own grid column.
+                for c in start..col {
+                    let glyph = screen
+                        .cell(row, c)
+                        .map(|cell| cell.contents())
+                        .unwrap_or_default();
+                    if glyph.is_empty() || glyph == " " {
+                        continue;
+                    }
+                    let x = inner.min.x + c as f32 * cw;
+                    painter.text(Pos2::new(x, y), Align2::LEFT_TOP, glyph, font.clone(), eff_fg);
                 }
             }
         }
