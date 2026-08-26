@@ -34,88 +34,14 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// Build the window / macOS dock icon: an orange "RS" on a dark rounded
-/// square, drawn from a hand-coded 5×7 bitmap font (no image dependency). This
-/// replaces eframe's default egui "e" glyph.
+/// Build the window / macOS dock icon from the bundled PNG artwork
+/// (`assets/icon.png`), decoded at startup via eframe's built-in `image`
+/// support. The same artwork backs the macOS `.app` bundle icon
+/// (`Contents/Resources/AppIcon.icns`), so the dock icon matches whether the
+/// app is running or at rest in Finder.
 fn app_icon() -> egui::IconData {
-    const W: usize = 256;
-    const H: usize = 256;
-    const RADIUS: f32 = 48.0;
-    const SCALE: usize = 20; // side of one font "pixel" block
-    const GAP: usize = 1; // columns between the two glyphs
-
-    let bg: [u8; 4] = [0x1a, 0x1b, 0x1f, 0xff]; // dark card background
-    let fg: [u8; 4] = [0xff, 0x8c, 0x2a, 0xff]; // ORANGE accent
-
-    // 5 wide × 7 tall bitmaps for the two letters.
-    let r_glyph: [[u8; 5]; 7] = [
-        [1, 1, 1, 1, 0],
-        [1, 0, 0, 0, 1],
-        [1, 0, 0, 0, 1],
-        [1, 1, 1, 1, 0],
-        [1, 0, 1, 0, 0],
-        [1, 0, 0, 1, 0],
-        [1, 0, 0, 0, 1],
-    ];
-    let s_glyph: [[u8; 5]; 7] = [
-        [0, 1, 1, 1, 1],
-        [1, 0, 0, 0, 0],
-        [1, 0, 0, 0, 0],
-        [0, 1, 1, 1, 0],
-        [0, 0, 0, 0, 1],
-        [0, 0, 0, 0, 1],
-        [1, 1, 1, 1, 0],
-    ];
-
-    let mut rgba = vec![0u8; W * H * 4]; // transparent by default
-
-    // Rounded-square background.
-    let inside = |x: f32, y: f32| -> bool {
-        let cx = x.clamp(RADIUS, W as f32 - RADIUS);
-        let cy = y.clamp(RADIUS, H as f32 - RADIUS);
-        let (dx, dy) = (x - cx, y - cy);
-        dx * dx + dy * dy <= RADIUS * RADIUS
-    };
-    for y in 0..H {
-        for x in 0..W {
-            if inside(x as f32 + 0.5, y as f32 + 0.5) {
-                let i = (y * W + x) * 4;
-                rgba[i..i + 4].copy_from_slice(&bg);
-            }
-        }
-    }
-
-    // Center the two glyphs.
-    let block_w = (5 * 2 + GAP) * SCALE;
-    let block_h = 7 * SCALE;
-    let x0 = (W - block_w) / 2;
-    let y0 = (H - block_h) / 2;
-
-    let mut draw = |glyph: &[[u8; 5]; 7], ox: usize| {
-        for (gy, row) in glyph.iter().enumerate() {
-            for (gx, &on) in row.iter().enumerate() {
-                if on == 0 {
-                    continue;
-                }
-                for dy in 0..SCALE {
-                    for dx in 0..SCALE {
-                        let px = ox + gx * SCALE + dx;
-                        let py = y0 + gy * SCALE + dy;
-                        let i = (py * W + px) * 4;
-                        rgba[i..i + 4].copy_from_slice(&fg);
-                    }
-                }
-            }
-        }
-    };
-    draw(&r_glyph, x0);
-    draw(&s_glyph, x0 + (5 + GAP) * SCALE);
-
-    egui::IconData {
-        rgba,
-        width: W as u32,
-        height: H as u32,
-    }
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .expect("bundled assets/icon.png should be a valid PNG")
 }
 
 /// Spawn a shell in a PTY, run a command, and confirm its output shows up in

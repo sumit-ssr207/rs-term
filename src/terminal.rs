@@ -190,6 +190,18 @@ impl PtyTerminal {
             }
         };
         cmd.env("TERM", "xterm-256color");
+        // Ensure a UTF-8 locale. GUI apps launched from Finder/Dock inherit no
+        // LANG, dropping tmux and child programs (the shell, Claude Code, etc.)
+        // into the C/POSIX locale — where wide-character width calculations and
+        // UTF-8 handling differ from ours, which garbles Unicode output over
+        // time. Only supply one when the environment is missing it, so an
+        // explicit user locale is never overridden.
+        if std::env::var_os("LC_ALL").is_none()
+            && std::env::var_os("LC_CTYPE").is_none()
+            && std::env::var_os("LANG").is_none()
+        {
+            cmd.env("LANG", "en_US.UTF-8");
+        }
 
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
@@ -456,6 +468,28 @@ impl PtyTerminal {
         if let Ok(mut p) = self.parser.lock() {
             p.set_size(rows, cols);
         }
+    }
+
+    /// Force tmux to fully repaint the pane, resyncing our emulated grid with
+    /// tmux's authoritative one.
+    ///
+    /// rs-term mirrors a tmux pane through the vt100 emulator, but tmux renders
+    /// *differentially* — it only sends cells it believes changed. If our grid
+    /// ever drifts from tmux's (an emulation edge case, a dropped cell), tmux
+    /// never resends those cells, so the garble persists until the app restarts
+    /// and re-attaches. The only thing that makes tmux resend the whole screen
+    /// is a size change, so we nudge the pty one column narrower here; the very
+    /// next per-frame `resize()` restores the real width, and the two SIGWINCHes
+    /// make tmux repaint everything — clearing the drift without a restart.
+    pub fn force_redraw(&mut self) {
+        let (nudge_rows, nudge_cols) = if self.cols > 1 {
+            (self.rows, self.cols - 1)
+        } else if self.rows > 1 {
+            (self.rows - 1, self.cols)
+        } else {
+            return; // 1x1 pane — nothing sensible to nudge
+        };
+        self.resize(nudge_rows, nudge_cols);
     }
 
     pub fn is_dead(&mut self) -> bool {

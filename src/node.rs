@@ -8,6 +8,10 @@ use crate::terminal::PtyTerminal;
 pub struct Node {
     pub id: u64,
     pub title: String,
+    /// User-entered manual label. When set (non-empty), it overrides the
+    /// auto-generated "what it's doing" title in the window's title bar.
+    /// Persisted. `None` means fall back to the automatic title.
+    pub label: Option<String>,
     /// Top-left position in world coordinates (canvas space at zoom 1.0).
     pub pos: egui::Pos2,
     /// Size in world units.
@@ -34,6 +38,20 @@ pub struct TerminalNode {
     pub agent: bool,
     /// Lazily created on first render (needs an egui Context).
     pub term: Option<PtyTerminal>,
+    /// Runtime-only mouse text selection over the visible grid, as
+    /// `(anchor, head)` cells in `(row, col)`. `anchor` is where the drag
+    /// began; `head` follows the pointer. Used to highlight and to copy with
+    /// ⌘C. Cleared on click or on new keystrokes. Not persisted.
+    pub selection: Option<Selection>,
+}
+
+/// A rectangular-by-reading-order text selection on a terminal's visible grid.
+#[derive(Clone, Copy)]
+pub struct Selection {
+    /// Cell where the drag started, `(row, col)`.
+    pub anchor: (u16, u16),
+    /// Cell currently under the pointer, `(row, col)`.
+    pub head: (u16, u16),
 }
 
 pub struct NoteNode {
@@ -74,6 +92,9 @@ pub struct SavedCanvas {
 pub struct SavedNode {
     pub id: u64,
     pub title: String,
+    /// Manual override label; absent in layouts saved before this field existed.
+    #[serde(default)]
+    pub label: Option<String>,
     pub pos: [f32; 2],
     pub size: [f32; 2],
     pub kind: SavedKind,
@@ -105,6 +126,7 @@ impl Node {
         SavedNode {
             id: self.id,
             title: self.title.clone(),
+            label: self.label.clone(),
             pos: [self.pos.x, self.pos.y],
             size: [self.size.x, self.size.y],
             kind,
@@ -117,12 +139,14 @@ impl Node {
                 cwd: cwd.map(std::path::PathBuf::from),
                 agent,
                 term: None,
+                selection: None,
             }),
             SavedKind::Note { text } => NodeKind::Note(NoteNode { text }),
         };
         Node {
             id: s.id,
             title: s.title,
+            label: s.label,
             pos: egui::pos2(s.pos[0], s.pos[1]),
             size: egui::vec2(s.size[0], s.size[1]),
             kind,

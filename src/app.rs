@@ -3,7 +3,7 @@
 use eframe::egui;
 use egui::{Align2, Color32, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
 
-use crate::node::{Node, NodeKind, NoteNode, TerminalNode};
+use crate::node::{Node, NodeKind, NoteNode, Selection, TerminalNode};
 use crate::terminal::PtyTerminal;
 
 // --- visual constants (in world units at zoom 1.0) ---
@@ -36,6 +36,10 @@ struct Canvas {
     focused: Option<u64>,
     moving: Option<u64>,
     resizing: Option<u64>,
+    /// Node whose terminal body is mid drag-to-select, if any. Kept in
+    /// `active_node` so the body interaction stays live even when the pointer
+    /// slips outside the node during a fast drag.
+    selecting: Option<u64>,
     menu_world: Pos2,
 }
 
@@ -50,6 +54,7 @@ impl Canvas {
             focused: None,
             moving: None,
             resizing: None,
+            selecting: None,
             menu_world: Pos2::ZERO,
         }
     }
@@ -73,6 +78,12 @@ pub struct RsTermApp {
     last_bell_sound: std::time::Instant,
     /// Whether the bottom-right minimap is shown (toggled from the tab bar).
     show_minimap: bool,
+    /// Node id whose title is currently being edited inline, if any.
+    renaming: Option<u64>,
+    /// Scratch buffer backing the inline label editor.
+    rename_buf: String,
+    /// Focus the label editor on the frame it first opens.
+    rename_focus: bool,
 }
 
 impl RsTermApp {
@@ -90,6 +101,9 @@ impl RsTermApp {
             last_save: std::time::Instant::now(),
             last_bell_sound: std::time::Instant::now(),
             show_minimap: true,
+            renaming: None,
+            rename_buf: String::new(),
+            rename_focus: false,
         };
         app.load_layout();
         if app.canvases.is_empty() {
@@ -179,6 +193,7 @@ impl RsTermApp {
                 focused: None,
                 moving: None,
                 resizing: None,
+                selecting: None,
                 menu_world: Pos2::ZERO,
             })
             .collect();
@@ -277,9 +292,11 @@ impl RsTermApp {
                 cwd,
                 agent: false,
                 term: None,
+                selection: None,
             }),
             glow_start: None,
             restore: None,
+            label: None,
         });
         c.focused = Some(id);
         self.mark_dirty();
@@ -302,9 +319,11 @@ impl RsTermApp {
                 cwd,
                 agent: true,
                 term: None,
+                selection: None,
             }),
             glow_start: None,
             restore: None,
+            label: None,
         });
         c.focused = Some(id);
         self.mark_dirty();
@@ -324,6 +343,7 @@ impl RsTermApp {
             }),
             glow_start: None,
             restore: None,
+            label: None,
         });
         c.focused = Some(id);
         self.mark_dirty();
@@ -388,6 +408,23 @@ impl RsTermApp {
         }
     }
 
+    /// Force the focused terminal to fully repaint from tmux, clearing any
+    /// drift between our emulated grid and tmux's own (⌘R, or the body menu).
+    /// The nudge resize takes effect now; the next frame's per-frame resize
+    /// restores the real size, so we request a repaint to make that happen.
+    fn force_redraw_focused(&mut self, ctx: &egui::Context) {
+        let a = self.active;
+        let Some(id) = self.canvases[a].focused else { return };
+        if let Some(n) = self.canvases[a].nodes.iter_mut().find(|n| n.id == id) {
+            if let NodeKind::Terminal(t) = &mut n.kind {
+                if let Some(term) = &mut t.term {
+                    term.force_redraw();
+                    ctx.request_repaint();
+                }
+            }
+        }
+    }
+
     /// Index of the top-most terminal node whose rect contains `pos`.
     fn terminal_index_at(&self, pos: Pos2) -> Option<usize> {
         let c = &self.canvases[self.active];
@@ -417,8 +454,15 @@ impl RsTermApp {
         }
     }
 
-    /// The live title for a node ("what it's doing").
+    /// The live title for a node. A user-entered label wins; otherwise fall
+    /// back to the automatic "what it's doing" summary.
     fn display_title(&self, node: &Node) -> String {
+        if let Some(label) = node.label.as_deref() {
+            let label = label.trim();
+            if !label.is_empty() {
+                return label.to_string();
+            }
+        }
         match &node.kind {
             NodeKind::Terminal(t) => t
                 .term
@@ -690,13 +734,14 @@ impl RsTermApp {
         let pointer = ui.input(|i| i.pointer.hover_pos());
 
         // --- app-level keyboard shortcuts ---
-        let (new_term, new_note, do_save, close_focused) = ui.input(|i| {
+        let (new_term, new_note, do_save, close_focused, redraw_focused) = ui.input(|i| {
             let c = i.modifiers.command;
             (
                 c && i.key_pressed(egui::Key::T),
                 c && i.key_pressed(egui::Key::N),
                 c && i.key_pressed(egui::Key::S),
                 c && i.key_pressed(egui::Key::W),
+                c && i.key_pressed(egui::Key::R),
             )
         });
         if close_focused {
@@ -704,6 +749,9 @@ impl RsTermApp {
                 self.close_node(id);
                 self.mark_dirty();
             }
+        }
+        if redraw_focused {
+            self.force_redraw_focused(ctx);
         }
         if new_term {
             let p = self.s2w(self.viewport_center);
@@ -791,6 +839,7 @@ impl RsTermApp {
         let active_node = self.canvases[a]
             .moving
             .or(self.canvases[a].resizing)
+            .or(self.canvases[a].selecting)
             .or(topmost_hover);
 
         let zoom = self.canvases[a].zoom;
@@ -799,6 +848,8 @@ impl RsTermApp {
 
         let mut bring_to_front: Option<u64> = None;
         let mut to_close: Option<u64> = None;
+        // Node whose terminal the body context-menu asked to force-repaint.
+        let mut to_redraw: Option<u64> = None;
         // Set true while any node is mid-glow, so we can drive a smooth animation.
         let mut any_glow = false;
 
@@ -872,13 +923,53 @@ impl RsTermApp {
 
             let text_left = title_rect.min.x + 20.0 * zoom;
             let text_max = close_rect.min.x - 4.0 * zoom;
-            painter.text(
-                Pos2::new(text_left, title_rect.center().y),
-                Align2::LEFT_CENTER,
-                elide(&title, ((text_max - text_left) / (7.0 * zoom)).max(3.0) as usize),
-                FontId::proportional((12.5 * zoom).clamp(8.0, 24.0)),
-                Color32::from_rgb(0xcf, 0xd2, 0xd8),
-            );
+            let title_font = FontId::proportional((12.5 * zoom).clamp(8.0, 24.0));
+            if self.renaming == Some(id) {
+                // Inline label editor, sitting where the title text would be.
+                let edit_rect = Rect::from_min_max(
+                    Pos2::new(text_left, title_rect.min.y + 3.0 * zoom),
+                    Pos2::new(text_max.max(text_left + 40.0), title_rect.max.y - 3.0 * zoom),
+                );
+                let mut buf = std::mem::take(&mut self.rename_buf);
+                let out = ui.put(
+                    edit_rect,
+                    egui::TextEdit::singleline(&mut buf)
+                        .frame(false)
+                        .hint_text("label")
+                        .desired_width(f32::INFINITY)
+                        .text_color(Color32::from_rgb(0xff, 0xff, 0xff))
+                        .font(title_font.clone()),
+                );
+                if self.rename_focus {
+                    out.request_focus();
+                    self.rename_focus = false;
+                }
+                let (commit, cancel) = ui.input(|i| {
+                    (
+                        i.key_pressed(egui::Key::Enter),
+                        i.key_pressed(egui::Key::Escape),
+                    )
+                });
+                if cancel {
+                    self.renaming = None; // discard edits
+                } else if commit || out.lost_focus() {
+                    let t = buf.trim();
+                    self.canvases[a].nodes[i].label =
+                        if t.is_empty() { None } else { Some(t.to_string()) };
+                    self.renaming = None;
+                    self.mark_dirty();
+                } else {
+                    self.rename_buf = buf; // still editing
+                }
+            } else {
+                painter.text(
+                    Pos2::new(text_left, title_rect.center().y),
+                    Align2::LEFT_CENTER,
+                    elide(&title, ((text_max - text_left) / (7.0 * zoom)).max(3.0) as usize),
+                    title_font.clone(),
+                    Color32::from_rgb(0xcf, 0xd2, 0xd8),
+                );
+            }
 
             if is_active {
                 let close = ui.interact(close_rect, Id::new(("close", id)), Sense::click());
@@ -895,51 +986,75 @@ impl RsTermApp {
                 painter.line_segment([cc + Vec2::new(-r, -r), cc + Vec2::new(r, r)], Stroke::new(1.6f32, col));
                 painter.line_segment([cc + Vec2::new(-r, r), cc + Vec2::new(r, -r)], Stroke::new(1.6f32, col));
 
-                let drag_rect =
-                    Rect::from_min_max(title_rect.min, Pos2::new(close_rect.min.x, title_rect.max.y));
-                let td = ui.interact(drag_rect, Id::new(("title", id)), Sense::click_and_drag());
-                if td.drag_started() {
-                    self.canvases[a].moving = Some(id);
-                    self.canvases[a].focused = Some(id);
-                    bring_to_front = Some(id);
-                }
-                if self.canvases[a].moving == Some(id) {
-                    self.canvases[a].nodes[i].pos += td.drag_delta() / zoom;
-                }
-                if td.drag_stopped() {
-                    self.canvases[a].moving = None;
-                    self.mark_dirty();
-                }
-                if td.clicked() {
-                    self.canvases[a].focused = Some(id);
-                    bring_to_front = Some(id);
-                }
-                // Double-click the title bar: maximize to fill the viewport;
-                // double-click again to restore the previous position + size.
-                if td.double_clicked() {
-                    self.canvases[a].moving = None;
-                    let node = &mut self.canvases[a].nodes[i];
-                    if let Some((rp, rs)) = node.restore.take() {
-                        node.pos = rp;
-                        node.size = rs;
-                    } else {
-                        node.restore = Some((node.pos, node.size));
-                        // Screen rect of the viewport (minus a margin) back into
-                        // world units at the current zoom/offset.
-                        let m = 24.0_f32;
-                        let tl = (Pos2::new(panel.min.x + m, panel.min.y + m).to_vec2()
-                            - offset)
-                            / zoom;
-                        let sz = (panel.size() - Vec2::splat(m * 2.0)) / zoom;
-                        node.pos = tl.to_pos2();
-                        node.size = Vec2::new(sz.x.max(MIN_W), sz.y.max(MIN_H));
+                // While the inline label editor is open for this node, don't put a
+                // drag interactor over it — that would swallow clicks meant for the
+                // text field.
+                if self.renaming != Some(id) {
+                    let drag_rect =
+                        Rect::from_min_max(title_rect.min, Pos2::new(close_rect.min.x, title_rect.max.y));
+                    let td = ui.interact(drag_rect, Id::new(("title", id)), Sense::click_and_drag());
+                    if td.drag_started() {
+                        self.canvases[a].moving = Some(id);
+                        self.canvases[a].focused = Some(id);
+                        bring_to_front = Some(id);
                     }
-                    self.canvases[a].focused = Some(id);
-                    bring_to_front = Some(id);
-                    self.mark_dirty();
-                }
-                if td.hovered() {
-                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                    if self.canvases[a].moving == Some(id) {
+                        self.canvases[a].nodes[i].pos += td.drag_delta() / zoom;
+                    }
+                    if td.drag_stopped() {
+                        self.canvases[a].moving = None;
+                        self.mark_dirty();
+                    }
+                    if td.clicked() {
+                        self.canvases[a].focused = Some(id);
+                        bring_to_front = Some(id);
+                    }
+                    // Double-click the title bar: maximize to fill the viewport;
+                    // double-click again to restore the previous position + size.
+                    if td.double_clicked() {
+                        self.canvases[a].moving = None;
+                        let node = &mut self.canvases[a].nodes[i];
+                        if let Some((rp, rs)) = node.restore.take() {
+                            node.pos = rp;
+                            node.size = rs;
+                        } else {
+                            node.restore = Some((node.pos, node.size));
+                            // Screen rect of the viewport (minus a margin) back into
+                            // world units at the current zoom/offset.
+                            let m = 24.0_f32;
+                            let tl = (Pos2::new(panel.min.x + m, panel.min.y + m).to_vec2()
+                                - offset)
+                                / zoom;
+                            let sz = (panel.size() - Vec2::splat(m * 2.0)) / zoom;
+                            node.pos = tl.to_pos2();
+                            node.size = Vec2::new(sz.x.max(MIN_W), sz.y.max(MIN_H));
+                        }
+                        self.canvases[a].focused = Some(id);
+                        bring_to_front = Some(id);
+                        self.mark_dirty();
+                    }
+                    if td.hovered() {
+                        ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                    }
+                    // Right-click the title bar: label this window (or clear it).
+                    td.context_menu(|ui| {
+                        if ui.button("Rename…").clicked() {
+                            self.rename_buf = self.canvases[a].nodes[i]
+                                .label
+                                .clone()
+                                .unwrap_or_default();
+                            self.renaming = Some(id);
+                            self.rename_focus = true;
+                            ui.close_menu();
+                        }
+                        if self.canvases[a].nodes[i].label.is_some()
+                            && ui.button("Clear label").clicked()
+                        {
+                            self.canvases[a].nodes[i].label = None;
+                            self.mark_dirty();
+                            ui.close_menu();
+                        }
+                    });
                 }
 
                 let hs = RESIZE_HANDLE * zoom;
@@ -973,10 +1088,60 @@ impl RsTermApp {
                     );
                 }
 
-                let body = ui.interact(body_rect, Id::new(("body", id)), Sense::click());
+                // Terminals drag-to-select; notes keep click-only so their own
+                // egui text editor owns the drag for selecting note text.
+                let body_sense = if is_terminal {
+                    Sense::click_and_drag()
+                } else {
+                    Sense::click()
+                };
+                let body = ui.interact(body_rect, Id::new(("body", id)), body_sense);
                 if body.clicked() {
                     self.canvases[a].focused = Some(id);
                     bring_to_front = Some(id);
+                    // A plain click deselects.
+                    if let NodeKind::Terminal(t) = &mut self.canvases[a].nodes[i].kind {
+                        t.selection = None;
+                    }
+                }
+                // Drag over a terminal body selects its text (only terminals —
+                // notes host their own egui text editor).
+                if is_terminal {
+                    if body.hovered() {
+                        ctx.set_cursor_icon(egui::CursorIcon::Text);
+                    }
+                    if body.drag_started() {
+                        if let Some(p) = body.interact_pointer_pos() {
+                            let rc = point_to_cell(body_rect, cell, zoom, p);
+                            self.canvases[a].selecting = Some(id);
+                            self.canvases[a].focused = Some(id);
+                            bring_to_front = Some(id);
+                            if let NodeKind::Terminal(t) = &mut self.canvases[a].nodes[i].kind {
+                                t.selection = Some(Selection { anchor: rc, head: rc });
+                            }
+                        }
+                    }
+                    if self.canvases[a].selecting == Some(id) && body.dragged() {
+                        if let Some(p) = body.interact_pointer_pos() {
+                            let rc = point_to_cell(body_rect, cell, zoom, p);
+                            if let NodeKind::Terminal(t) = &mut self.canvases[a].nodes[i].kind {
+                                if let Some(sel) = &mut t.selection {
+                                    sel.head = rc;
+                                }
+                            }
+                        }
+                    }
+                    if body.drag_stopped() {
+                        self.canvases[a].selecting = None;
+                    }
+                    // Right-click: force a full repaint from tmux to clear any
+                    // stale/garbled cells that have drifted out of sync.
+                    body.context_menu(|ui| {
+                        if ui.button("Redraw (⌘R)").clicked() {
+                            to_redraw = Some(id);
+                            ui.close_menu();
+                        }
+                    });
                 }
             }
 
@@ -1030,6 +1195,10 @@ impl RsTermApp {
         if let Some(id) = to_close {
             self.close_node(id);
             self.mark_dirty();
+        }
+        if let Some(id) = to_redraw {
+            self.canvases[a].focused = Some(id);
+            self.force_redraw_focused(ctx);
         }
         // Keep animating smoothly while any node is glowing.
         if any_glow {
@@ -1372,6 +1541,30 @@ impl RsTermApp {
         let screen = guard.screen();
         let font = FontId::monospace(BASE_FONT * zoom);
 
+        let selection = match &self.canvases[a].nodes[i].kind {
+            NodeKind::Terminal(t) => t.selection,
+            _ => None,
+        };
+
+        // ⌘C copies the current selection to the system clipboard. egui-winit
+        // turns ⌘C into an `Event::Copy` (never a key event), so it never leaks
+        // to the pty; Ctrl+C stays a real keystroke and still sends SIGINT.
+        if is_focused {
+            let want_copy = ui.input(|inp| {
+                inp.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Copy | egui::Event::Cut))
+            });
+            if want_copy {
+                if let Some(sel) = selection {
+                    let text = selection_text(screen, sel, rows, cols);
+                    if !text.is_empty() {
+                        ctx.copy_text(text);
+                    }
+                }
+            }
+        }
+
         // Paint the grid. Backgrounds are batched into runs of the same style,
         // but each glyph is drawn snapped to its own cell (`col * cw`) rather
         // than laying a whole run out as a single string. egui positions the
@@ -1424,6 +1617,30 @@ impl RsTermApp {
                     let x = inner.min.x + c as f32 * cw;
                     painter.text(Pos2::new(x, y), Align2::LEFT_TOP, glyph, font.clone(), eff_fg);
                 }
+            }
+        }
+
+        // Selection highlight — a translucent overlay on top so the glyphs
+        // underneath stay legible. One rect per row, spanning the selected
+        // columns in reading order.
+        if let Some(sel) = selection {
+            let clampc =
+                |(r, c): (u16, u16)| (r.min(rows.saturating_sub(1)), c.min(cols.saturating_sub(1)));
+            let a0 = clampc(sel.anchor);
+            let b0 = clampc(sel.head);
+            let (s, e) = if b0 < a0 { (b0, a0) } else { (a0, b0) };
+            let hl = Color32::from_rgba_unmultiplied(0x53, 0x80, 0xc0, 0x66);
+            for r in s.0..=e.0 {
+                let cstart = if r == s.0 { s.1 } else { 0 };
+                let cend = if r == e.0 { e.1 } else { cols.saturating_sub(1) };
+                let x0 = inner.min.x + cstart as f32 * cw;
+                let x1 = inner.min.x + (cend as f32 + 1.0) * cw;
+                let y = inner.min.y + r as f32 * ch;
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1, y + ch)),
+                    0.0,
+                    hl,
+                );
             }
         }
 
@@ -1525,39 +1742,73 @@ impl RsTermApp {
             if let Some(term) = &mut t.term {
                 term.send(&out);
             }
+            // Typing invalidates a stale selection — the highlighted cells now
+            // hold different content.
+            t.selection = None;
         }
     }
 }
 
-/// Append a broad-coverage symbol font as a fallback so UI glyphs
-/// (● ✕ ▦ ⌘ ⌥ · … and box-drawing) render instead of showing tofu boxes.
+/// Append broad-coverage fallback fonts so glyphs the primary monospace font
+/// lacks still render instead of showing tofu boxes. This covers UI symbols
+/// (● ✕ ▦ ⌘ ⌥ · … and box-drawing) *and* non-Latin scripts such as Devanagari
+/// (Marathi/Hindi), which the default mono font has no glyphs for.
+///
+/// Each fallback is registered under its own key and appended in order; egui
+/// only reaches for a fallback when every earlier font in the chain lacks the
+/// glyph, so base cell metrics are unchanged. Order matters only when two
+/// fonts *both* cover a code point — we put symbol/box-drawing first, then the
+/// script fonts, then a broad catch-all last.
+///
+/// Note: egui/epaint does not do complex text shaping (no HarfBuzz), so
+/// Devanagari conjuncts and reordered matras won't be composed correctly — but
+/// the individual glyphs render instead of boxes.
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    let candidates = [
-        "/System/Library/Fonts/Apple Symbols.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+
+    // (key, path) pairs, tried in order. The first existing file for each key
+    // is loaded; missing files are skipped. `.ttc` collections load face 0.
+    let candidates: [(&str, &[&str]); 3] = [
+        // Symbols + box-drawing (used in the Claude Code banner, etc.).
+        ("symbols", &["/System/Library/Fonts/Apple Symbols.ttf"]),
+        // Devanagari — Marathi, Hindi, Sanskrit, Nepali.
+        (
+            "devanagari",
+            &[
+                "/System/Library/Fonts/Kohinoor.ttc",
+                "/System/Library/Fonts/Supplemental/Devanagari Sangam MN.ttc",
+                "/System/Library/Fonts/Supplemental/DevanagariMT.ttc",
+            ],
+        ),
+        // Broad Unicode catch-all for anything the above miss.
+        (
+            "unicode",
+            &["/System/Library/Fonts/Supplemental/Arial Unicode.ttf"],
+        ),
     ];
-    for path in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts
-                .font_data
-                .insert("symbols".to_owned(), egui::FontData::from_owned(bytes));
-            // Append the symbol font as a *fallback* on both families. Because it
-            // sits after the primary font, egui only reaches for it when the
-            // primary lacks a glyph — so base cell metrics are unchanged, but the
-            // terminal grid (which renders with the monospace family) no longer
-            // shows tofu boxes for glyphs the mono font is missing, e.g. the
-            // block/symbol glyphs in the Claude Code banner.
-            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+
+    let mut loaded: Vec<String> = Vec::new();
+    for (key, paths) in candidates {
+        for path in paths {
+            if let Ok(bytes) = std::fs::read(path) {
                 fonts
-                    .families
-                    .entry(family)
-                    .or_default()
-                    .push("symbols".to_owned());
+                    .font_data
+                    .insert(key.to_owned(), egui::FontData::from_owned(bytes));
+                loaded.push(key.to_owned());
+                break;
             }
-            break;
         }
     }
+
+    // Append every loaded fallback, in candidate order, to both families so the
+    // monospace terminal grid and the proportional UI both benefit.
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let list = fonts.families.entry(family).or_default();
+        for key in &loaded {
+            list.push(key.clone());
+        }
+    }
+
     ctx.set_fonts(fonts);
 }
 
@@ -1611,6 +1862,36 @@ fn elide(s: &str, max_chars: usize) -> String {
         let t: String = s.chars().take(max_chars - 1).collect();
         format!("{t}…")
     }
+}
+
+/// Map a screen point to the `(row, col)` grid cell inside a terminal body,
+/// clamped to the visible grid. Mirrors the geometry `render_terminal` uses to
+/// paint the grid (`inner = body_rect.shrink(4*zoom)`, cell pitch `cell*zoom`),
+/// so a click lands on the glyph under the pointer.
+fn point_to_cell(body_rect: Rect, cell: Vec2, zoom: f32, p: Pos2) -> (u16, u16) {
+    let inner = body_rect.shrink(4.0 * zoom);
+    let cw = (cell.x * zoom).max(1.0);
+    let ch = (cell.y * zoom).max(1.0);
+    let cols = (inner.width() / cw).floor().max(1.0);
+    let rows = (inner.height() / ch).floor().max(1.0);
+    let col = ((p.x - inner.min.x) / cw).floor().clamp(0.0, cols - 1.0) as u16;
+    let row = ((p.y - inner.min.y) / ch).floor().clamp(0.0, rows - 1.0) as u16;
+    (row, col)
+}
+
+/// Extract the plain text of a selection from the visible screen, ordered in
+/// reading order regardless of drag direction. The `head` cell is included, and
+/// trailing blanks on each line are dropped (vt100's `contents_between` skips
+/// them and keeps soft-wrapped rows joined).
+fn selection_text(screen: &vt100::Screen, sel: Selection, rows: u16, cols: u16) -> String {
+    let clamp = |(r, c): (u16, u16)| (r.min(rows.saturating_sub(1)), c.min(cols.saturating_sub(1)));
+    let a = clamp(sel.anchor);
+    let b = clamp(sel.head);
+    let (start, end) = if b < a { (b, a) } else { (a, b) };
+    // `contents_between`'s end column is exclusive; +1 makes the head cell part
+    // of the selection.
+    let end_col = end.1.saturating_add(1).min(cols);
+    screen.contents_between(start.0, start.1, end.0, end_col)
 }
 
 fn cell_style(screen: &vt100::Screen, row: u16, col: u16) -> (vt100::Color, vt100::Color, bool) {
