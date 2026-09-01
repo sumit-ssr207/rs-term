@@ -1,18 +1,37 @@
 # rs-term
 
-A **node-based terminal manager**, written in Rust. Your terminals and notes
-live as draggable cards on infinite, tabbed pan/zoom canvases instead of stacked
-tabs — a native Rust reimagining of the core idea behind
-[nodeterm](https://github.com/eneskirca/nodeterm), built with
-[`egui`](https://github.com/emilk/egui). No Electron, single ~6 MB binary.
+**A canvas-like manager for terminals, written in Rust.**
 
-## ⚠️ Installing the app (unsigned build — read this first)
+Inspired by [nodeterm](https://github.com/eneskirca/nodeterm), rs-term reimagines
+terminal management as a spatial workspace: instead of stacked tabs, your
+terminals and notes live as draggable cards on infinite, tabbed pan/zoom
+canvases. Arrange them the way you think — group a build shell next to its
+logs, park a scratch note beside a long-running job, zoom out to see everything
+at once.
+
+Built natively with [`egui`](https://github.com/emilk/egui) — no Electron, no
+web stack. The result is a single ~6 MB binary that stays **very fluid**: panning,
+zooming, dragging, and live terminal output all render at native speed, even
+with many terminals on screen.
+
+## Highlights
+
+- **Spatial, not stacked** — an infinite canvas per tab; pan, zoom, and arrange
+  terminals freely instead of hunting through tab bars.
+- **Native performance** — pure Rust + `egui` immediate-mode rendering. Smooth
+  at every zoom level, instant input, tiny footprint.
+- **Sessions that survive** — terminals are tmux-backed, so quitting the app
+  doesn't kill your shells. Relaunch and everything re-attaches.
+- **A real terminal** — actual PTY with a `vt100` emulator, 256-color,
+  truecolor, and inverse video support.
+
+## Installing on macOS (unsigned build)
 
 > [!IMPORTANT]
 > This build is **not signed with a paid Apple Developer ID and not notarized**,
 > so on first launch macOS Gatekeeper will block it with a message like
-> *"can't be opened / unidentified developer / is damaged."* **This is expected**
-> — the app is fine. After unzipping, do **one** of the following (only needed once):
+> *"can't be opened / unidentified developer / is damaged."* This is expected —
+> the app is fine. After unzipping, do **one** of the following (only needed once):
 >
 > - **Right-click `rs-term.app` → Open**, then click **Open** in the dialog, **or**
 > - **Run in Terminal:**
@@ -40,7 +59,8 @@ tabs — a native Rust reimagining of the core idea behind
   live zoom percentage.
 - **Terminal nodes** — real PTY (`portable-pty`) through a `vt100` emulator, 256
   color + truecolor + inverse video. Resize the card and the PTY/tmux reflow.
-- **Sticky notes** — editable text cards.
+- **Sticky notes** — editable text cards for context that doesn't belong in a
+  shell.
 - **Direct manipulation** — drag the title bar to move, corner to resize, ✕ to
   close; **double-click the title bar to maximize** the node to fill the
   viewport, double-click again to restore; focused card highlighted, status dot
@@ -75,7 +95,8 @@ cargo run --release          # launch the app
 cargo run -- --selftest      # headless PTY+vt100 pipeline check (no window)
 ```
 
-Requires a Rust toolchain (`rustup`, stable) and, for persistence, `tmux`.
+Requires a Rust toolchain (`rustup`, stable) and, for session persistence,
+`tmux`.
 
 ## Architecture
 
@@ -92,11 +113,12 @@ one affine transform (`screen = world * zoom + offset`). Every terminal owns a
 reader thread (bytes → shared `vt100::Parser`) and a poller thread (tmux →
 title summary), both waking the UI via `egui::Context::request_repaint`.
 
-## Scope
+## Scope & acknowledgements
 
-Implements nodeterm's spatial terminal canvas + tmux persistence + tabs. The
-upstream product additionally has AI-agent orchestration, kanban views,
-SSH/remote projects, an iOS companion, and voice dictation — out of scope here.
+rs-term implements the core of nodeterm's idea — the spatial terminal canvas,
+tmux persistence, and tabbed workspaces — as a native Rust app. The upstream
+product additionally has AI-agent orchestration, kanban views, SSH/remote
+projects, an iOS companion, and voice dictation, which are out of scope here.
 
 ## License
 
