@@ -53,8 +53,15 @@ with many terminals on screen.
   first line.
 - **Tabbed canvases** — multiple independent canvases across the top. Add with
   `＋`, switch by clicking, close with `✕` (closing a canvas kills its sessions).
-- **Infinite canvas** — pan by dragging empty space; **scroll to zoom** toward
-  the cursor; **hold ⌥ (Option) and two-finger scroll to pan**. Subtle grid.
+- **Infinite canvas** — pan by dragging empty space or with a plain two-finger
+  scroll; **hold ⌥ (Option) and scroll to zoom** toward the cursor; pinch to
+  zoom. Subtle grid.
+- **Terminal scrollback** — **hold ⌥ (Option) and scroll over a terminal** to
+  scroll inside its content instead of moving the canvas. A maximized terminal
+  scrolls with a plain scroll, like any ordinary app window.
+- **Maximize on double-click** — **double-click a terminal's header** to
+  maximize it to fill the viewport; double-click again to restore it to its
+  place on the canvas.
 - **Zoom controls** — `－ / ＋ / 100% / Fit` buttons along the bottom bar, with a
   live zoom percentage.
 - **Terminal nodes** — real PTY (`portable-pty`) through a `vt100` emulator, 256
@@ -62,9 +69,7 @@ with many terminals on screen.
 - **Sticky notes** — editable text cards for context that doesn't belong in a
   shell.
 - **Direct manipulation** — drag the title bar to move, corner to resize, ✕ to
-  close; **double-click the title bar to maximize** the node to fill the
-  viewport, double-click again to restore; focused card highlighted, status dot
-  per node type.
+  close; focused card highlighted, status dot per node type.
 - **Attention bell** — when a terminal rings the bell (e.g. Claude Code finishes
   a turn and is waiting on you), the node plays a soft sound and pulses a gentle
   glow around its whole frame, so you can tell at a glance which node needs you.
@@ -74,16 +79,18 @@ with many terminals on screen.
 
 ## Keyboard & mouse
 
-| Input                     | Action                          |
-|---------------------------|---------------------------------|
-| `⌘T` / `⌘N`               | New terminal / note             |
-| `⌘W`                      | Close focused node              |
-| `⌘S`                      | Save layout                     |
-| Scroll                    | Zoom to cursor                  |
-| **⌥ + two-finger scroll** | Pan the canvas                  |
-| Drag empty space          | Pan the canvas                  |
-| **Double-click title bar**| Maximize node / restore         |
-| Right-click empty space   | "New terminal / note here" menu |
+| Input                          | Action                                   |
+|--------------------------------|------------------------------------------|
+| `⌘T` / `⌘N`                    | New terminal / note                      |
+| `⌘W`                           | Close focused node                       |
+| `⌘S`                           | Save layout                              |
+| Scroll                         | Pan the canvas                           |
+| Drag empty space               | Pan the canvas                           |
+| **⌥ + scroll** (over terminal) | Scroll inside the terminal's content     |
+| **⌥ + scroll** (over canvas)   | Zoom toward cursor                       |
+| Pinch                          | Zoom                                     |
+| **Double-click header**        | Maximize terminal / restore              |
+| Right-click empty space        | "New terminal / note here" menu          |
 
 Inside a focused terminal, all normal keys — `Ctrl` combos, arrows, Enter, Tab,
 Backspace, and paste — go to the shell.
